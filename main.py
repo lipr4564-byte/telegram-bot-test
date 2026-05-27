@@ -9,7 +9,7 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 # Считываем ID владельца из переменной окружения (или используем твой по умолчанию)
-ADMIN_ID = int(os.getenv('ADMIN_ID', 7930482209))
+ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
 
 # ID тем (взяты из последних цифр твоих ссылок: .../4, .../6, .../14)
 TARGET_TOPICS = [4, 6, 14]
