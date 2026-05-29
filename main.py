@@ -1,52 +1,65 @@
 import os
+import threading
 import telebot
 
-# Считываем токен из переменной окружения на хостинге
+# Считываем токен из настроек хостинга
 TOKEN = os.getenv('BOT_TOKEN')
 if not TOKEN:
     raise ValueError("Переменная BOT_TOKEN не задана на хостинге!")
 
 bot = telebot.TeleBot(TOKEN)
 
-# Считываем ID владельца из переменной окружения (или используем твой по умолчанию)
+# Считываем ID владельца из настроек хостинга (0 — если не задан)
 ADMIN_ID = int(os.getenv('ADMIN_ID', 0))
 
-# ID тем (взяты из последних цифр твоих ссылок: .../4, .../6, .../14)
-TARGET_TOPICS = [4, 6, 14]
+# Список твоих тем
+TARGET_TOPICS = [4, 6, 12, 14]
+
+# Функция для отложенного удаления
+def delete_delayed(chat_id, message_id, delay_seconds):
+    def _delete():
+        try:
+            bot.delete_message(chat_id, message_id)
+        except Exception:
+            pass
+    
+    # Запускаем таймер, который выполнит функцию _delete через delay_seconds
+    timer = threading.Timer(delay_seconds, _delete)
+    timer.start()
 
 @bot.message_handler(content_types=['text'])
 def filter_offtop(message):
-    # 1. Проверяем, находится ли сообщение в нужной теме
+    # Проверяем тему
     if message.message_thread_id not in TARGET_TOPICS:
         return
 
-    # Получаем текст сообщения
     text = message.text
     if not text:
         return
 
-    # 2. Проверяем наличие исключений: '//' или '#'
-    if '//' in text or '#' in text:
+    # 1. Если есть '#' — вообще не трогаем сообщение
+    if '#' in text:
         return
 
-    # 3. Считаем количество слов (разделяем текст по пробелам)
-    word_count = len(text.split())
+    # 2. Если есть '//' — запускаем таймер на 40 минут (2400 секунд)
+    if '//' in text:
+        delete_delayed(message.chat.id, message.message_id, 2400)
+        return
 
-    # 4. Если слов от 1 до 10 (включительно) - удаляем
+    # 3. Обычные сообщения без // и #
+    # Считаем слова: если от 1 до 10 - удаляем СРАЗУ
+    word_count = len(text.split())
     if 1 <= word_count <= 10:
         try:
             bot.delete_message(message.chat.id, message.message_id)
         except Exception:
-            # Ошибка может возникнуть, если у бота нет прав на удаление
             pass
 
-# Небольшая команда для проверки статуса (работает ТОЛЬКО для тебя)
 @bot.message_handler(commands=['status'])
 def check_status(message):
     if message.from_user.id == ADMIN_ID:
-        bot.send_message(message.chat.id, "Бот работает и следит за оффтопом.")
+        bot.send_message(message.chat.id, "Бот-чистильщик работает.\nКороткий оффтоп — сразу в мусорку.\nОффтоп с '//' — удаляется через 40 минут.")
 
-# Запуск бота в бесконечном цикле
 if __name__ == '__main__':
-    print("Бот запущен...")
+    print("Чистильщик запущен. Таймер на 40 минут активирован...")
     bot.infinity_polling(none_stop=True)
