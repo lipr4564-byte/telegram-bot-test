@@ -127,9 +127,9 @@ def init_db():
 
         conn.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('deleted_total', 0);")
         conn.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('started_at', ?);", (int(time.time()),))
-        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('timer_seconds', '2400');")  # 40 минут по умолчанию
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('timer_seconds', '2400');")  # 40 минут
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('offtop_max_words', '10');")  # До 10 слов = оффтоп (мгновенно)
 
-        # Если в ENV заданы дефолтные темы, добавляем их
         if ENV_TOPICS_RAW:
             for part in ENV_TOPICS_RAW.replace(',', ' ').replace(';', ' ').split():
                 if part.lstrip('-').isdigit():
@@ -241,14 +241,16 @@ def db_clear_all_pending() -> List[Tuple[int, int]]:
 
 cache_lock = threading.Lock()
 RP_TIMER_SECONDS: int = int(get_config('timer_seconds', '2400') or '2400')
+OFFTOP_MAX_WORDS: int = int(get_config('offtop_max_words', '10') or '10')
 TRACKED_TOPICS: Set[int] = set()
 
 
 def reload_cache():
     """Синхронизирует переменные в оперативной памяти с базой SQLite."""
-    global RP_TIMER_SECONDS, TRACKED_TOPICS
+    global RP_TIMER_SECONDS, OFFTOP_MAX_WORDS, TRACKED_TOPICS
     with cache_lock:
         RP_TIMER_SECONDS = int(get_config('timer_seconds', '2400') or '2400')
+        OFFTOP_MAX_WORDS = int(get_config('offtop_max_words', '10') or '10')
         TRACKED_TOPICS = set(get_topics_from_db())
 
 
@@ -378,7 +380,7 @@ def schedule_deletion(chat_id: int, message_id: int, thread_id: Optional[int], d
         if success:
             matched_id = thread_id if thread_id is not None else "Основная"
             log_event(
-                f"🗑 <b>[Удаление по таймеру]</b> В теме <code>{matched_id}</code> удалено сообщение от <b>{user_info or 'Unknown'}</b> "
+                f"🗑 <b>[Удаление по таймеру]</b> В теме <code>{matched_id}</code> удален длинный пост без # от <b>{user_info or 'Unknown'}</b> "
                 f"(таймер {format_seconds(int(delay_seconds))} истёк):\n<i>«{snippet}»</i>"
             )
 
@@ -468,11 +470,15 @@ def build_admin_main_text() -> str:
     text = (
         "🤖 <b>Панель управления Cleaner Bot (Райс)</b>\n\n"
         f"⚡ <b>Статус:</b> <code>Активен 🟢</code> | <b>Аптайм:</b> <code>{uptime_str}</code>\n"
-        f"⏱ <b>Таймер удаления:</b> <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n\n"
+        f"⏱ <b>Таймер для длинных постов без #:</b> <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n"
+        f"📝 <b>Лимит оффтопа (мгновенное удаление):</b> <code>≤ {OFFTOP_MAX_WORDS} слов, стикеры, GIF</code>\n\n"
         f"🗂 <b>Отслеживаемые темы:</b>\n{topics_str}\n\n"
-        f"⏳ <b>Сообщений в очереди:</b> <code>{pending_cnt}</code>\n"
+        f"⏳ <b>Постов в очереди на удаление (по таймеру):</b> <code>{pending_cnt}</code>\n"
         f"📊 <b>Всего удалено за все время:</b> <code>{deleted_cnt}</code>\n\n"
-        "💡 <i>Правило: Все сообщения, гифки и стикеры без <code>#</code> удаляются через таймер. Сообщения с <code>#</code> сохраняются навсегда!</i>"
+        "📜 <b>Правила работы:</b>\n"
+        "1. Сообщения с <code>#</code> сохраняются <b>навсегда</b>.\n"
+        "2. Короткие сообщения (≤ 10 слов), стикеры и гифки без <code>#</code> удаляются <b>мгновенно</b>.\n"
+        "3. Длинные посты (> 10 слов) без <code>#</code> удаляются <b>по таймеру ({format_seconds(RP_TIMER_SECONDS)})</b>."
     )
     return text
 
@@ -488,7 +494,7 @@ def build_admin_main_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("➖ Удалить тему", callback_data="adm:remove_menu"),
     )
     kb.add(
-        types.InlineKeyboardButton("📋 Список тем", callback_data="adm:list_topics"),
+        types.InlineKeyboardButton("⚙️ Порог слов оффтопа", callback_data="adm:offtop_limit"),
         types.InlineKeyboardButton("📊 Статистика", callback_data="adm:stats"),
     )
     kb.add(
@@ -523,7 +529,7 @@ def build_remove_topics_keyboard() -> types.InlineKeyboardMarkup:
 def handle_in_chat_offtop_command(message: types.Message):
     """
     При отправке команды /offtop в тему:
-    - Бот привязывает тему для отслеживания и очистки по таймеру
+    - Бот привязывает тему для отслеживания
     - Отвечает "скор индюк"
     - Логирует действие
     """
@@ -538,7 +544,7 @@ def handle_in_chat_offtop_command(message: types.Message):
     add_topic_to_db(effective_topic_id)
     reload_cache()
 
-    # Отвечаем "скор индюк", как и просили
+    # Отвечаем "скор индюк"
     bot.reply_to(message, "скор индюк")
     log_event(f"➕ <b>Админ [ID: {user_id}]</b> включил очистку в теме <code>{effective_topic_id}</code> командой <code>/offtop</code> (скор индюк).")
 
@@ -567,7 +573,8 @@ def handle_in_chat_id_command(message: types.Message):
         f"ℹ️ <b>Информация о ветке:</b>\n"
         f"• Чат ID: <code>{chat_id}</code>\n"
         f"• ID темы (thread_id): <code>{effective_topic_id}</code>\n"
-        f"• Таймер удаления: <b>{format_seconds(RP_TIMER_SECONDS)}</b>",
+        f"• Таймер длинных постов: <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n"
+        f"• Оффтоп (мгновенно): <b>≤ {OFFTOP_MAX_WORDS} слов, стикеры, GIF</b>",
         message_thread_id=thread_id,
         parse_mode='HTML',
         reply_markup=kb
@@ -637,7 +644,32 @@ def handle_admin_text_input(message: types.Message):
             with states_lock:
                 admin_states[user_id] = {'action': 'set_timer'}
 
-    # 2. Добавление темы
+    # 2. Изменение порога слов оффтопа
+    elif action == 'set_offtop_limit':
+        try:
+            max_w = int(text)
+            if max_w < 1 or max_w > 100:
+                raise ValueError
+            set_config('offtop_max_words', max_w)
+            reload_cache()
+            bot.send_message(
+                message.chat.id,
+                f"✅ <b>Порог оффтопа обновлен: сообщения до {max_w} слов удаляются мгновенно!</b>",
+                parse_mode='HTML',
+                reply_markup=build_admin_main_keyboard()
+            )
+            log_event(f"⚙️ <b>Админ [ID: {user_id}]</b> изменил порог оффтопа на <b>≤ {max_w} слов</b>.")
+        except ValueError:
+            bot.send_message(
+                message.chat.id,
+                "❌ Введите целое положительное число (например: <code>10</code> или <code>5</code>):",
+                parse_mode='HTML',
+                reply_markup=build_cancel_keyboard()
+            )
+            with states_lock:
+                admin_states[user_id] = {'action': 'set_offtop_limit'}
+
+    # 3. Добавление темы
     elif action == 'add_topic':
         try:
             topic_id = int(text)
@@ -647,7 +679,9 @@ def handle_admin_text_input(message: types.Message):
             bot.send_message(
                 message.chat.id,
                 f"✅ <b>Тема {topic_id} успешно добавлена в список отслеживания!</b>\n"
-                f"Сообщения, гифки и стикеры без <code>#</code> будут удаляться через <b>{format_seconds(RP_TIMER_SECONDS)}</b>.",
+                f"• Короткие (≤ {OFFTOP_MAX_WORDS} слов), гифки и стикеры без <code>#</code> удаляются <b>мгновенно</b>.\n"
+                f"• Длинные посты без <code>#</code> удаляются через <b>{format_seconds(RP_TIMER_SECONDS)}</b>.\n"
+                f"• Сообщения с <code>#</code> сохраняются <b>навсегда</b>.",
                 parse_mode='HTML',
                 reply_markup=build_admin_main_keyboard()
             )
@@ -662,7 +696,7 @@ def handle_admin_text_input(message: types.Message):
             with states_lock:
                 admin_states[user_id] = {'action': 'add_topic'}
 
-    # 3. Удаление темы вручную
+    # 4. Удаление темы вручную
     elif action == 'remove_manual':
         try:
             topic_id = int(text)
@@ -708,11 +742,11 @@ def handle_callbacks(call: types.CallbackQuery):
         reload_cache()
         bot.answer_callback_query(call.id, f"✅ Очистка включена в теме {tid}!")
         try:
-            bot.edit_message_text(f"✅ <b>Тема ID {tid} добавлена!</b>\nУдаление без # через {format_seconds(RP_TIMER_SECONDS)}.", chat_id=chat_id, message_id=msg_id, parse_mode='HTML')
+            bot.edit_message_text(f"✅ <b>Тема ID {tid} привязана!</b>\nОффтоп удаляется мгновенно, посты без # через {format_seconds(RP_TIMER_SECONDS)}.", chat_id=chat_id, message_id=msg_id, parse_mode='HTML')
             threading.Timer(5.0, lambda: delete_message_safe(chat_id, msg_id)).start()
         except Exception:
             pass
-        log_event(f"➕ <b>Админ [ID: {user_id}]</b> включил тему <code>{tid}</code> (Таймер {format_seconds(RP_TIMER_SECONDS)}).")
+        log_event(f"➕ <b>Админ [ID: {user_id}]</b> включил тему <code>{tid}</code>.")
         return
 
     elif data == "adm:close_temp":
@@ -768,7 +802,7 @@ def handle_callbacks(call: types.CallbackQuery):
             admin_states[user_id] = {'action': 'set_timer'}
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
-            f"⏱ <b>Настройка таймера удаления сообщений</b>\n\n"
+            f"⏱ <b>Настройка таймера удаления постов без #</b>\n\n"
             f"Текущее значение: <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n\n"
             f"Пришлите новое время в <b>минутах</b> (например: <code>10</code> или <code>40</code>):",
             chat_id=chat_id,
@@ -777,7 +811,22 @@ def handle_callbacks(call: types.CallbackQuery):
             reply_markup=build_cancel_keyboard()
         )
 
-    # 6. Добавление темы
+    # 6. Изменение порога слов оффтопа
+    elif data == "adm:offtop_limit":
+        with states_lock:
+            admin_states[user_id] = {'action': 'set_offtop_limit'}
+        bot.answer_callback_query(call.id)
+        bot.edit_message_text(
+            f"⚙️ <b>Настройка порога слов для мгновенного удаления</b>\n\n"
+            f"Текущий порог: сообщения до <b>{OFFTOP_MAX_WORDS} слов</b>, а также стикеры и GIF удаляются мгновенно.\n\n"
+            f"Пришлите новое число слов (например: <code>10</code> или <code>5</code>):",
+            chat_id=chat_id,
+            message_id=msg_id,
+            parse_mode='HTML',
+            reply_markup=build_cancel_keyboard()
+        )
+
+    # 7. Добавление темы
     elif data == "adm:add_topic":
         with states_lock:
             admin_states[user_id] = {'action': 'add_topic'}
@@ -785,7 +834,7 @@ def handle_callbacks(call: types.CallbackQuery):
         bot.edit_message_text(
             f"➕ <b>Добавление темы для очистки</b>\n\n"
             f"Пришлите <b>ID темы (thread_id)</b> форума:\n"
-            f"<i>(Сообщения, гифки и стикеры без # в ней будут удаляться через {format_seconds(RP_TIMER_SECONDS)})</i>\n\n"
+            f"<i>(Оффтоп ≤ {OFFTOP_MAX_WORDS} слов удалится сразу, посты без # — через {format_seconds(RP_TIMER_SECONDS)})</i>\n\n"
             f"💡 <i>Или просто напишите команду <code>/offtop</code> прямо внутри нужной темы в группе!</i>",
             chat_id=chat_id,
             message_id=msg_id,
@@ -793,7 +842,7 @@ def handle_callbacks(call: types.CallbackQuery):
             reply_markup=build_cancel_keyboard()
         )
 
-    # 7. Меню удаления тем
+    # 8. Меню удаления тем
     elif data == "adm:remove_menu":
         bot.answer_callback_query(call.id)
         all_topics = get_topics_from_db()
@@ -818,7 +867,7 @@ def handle_callbacks(call: types.CallbackQuery):
             reply_markup=build_remove_topics_keyboard()
         )
 
-    # 8. Удаление темы по кнопке
+    # 9. Удаление темы по кнопке
     elif data.startswith("adm:del_topic:"):
         topic_id_str = data.split(":")[-1]
         try:
@@ -838,7 +887,7 @@ def handle_callbacks(call: types.CallbackQuery):
         except Exception as e:
             bot.answer_callback_query(call.id, f"Ошибка: {e}")
 
-    # 9. Удаление темы ручным вводом
+    # 10. Удаление темы ручным вводом
     elif data == "adm:remove_manual":
         with states_lock:
             admin_states[user_id] = {'action': 'remove_manual'}
@@ -851,7 +900,7 @@ def handle_callbacks(call: types.CallbackQuery):
             reply_markup=build_cancel_keyboard()
         )
 
-    # 10. Список тем
+    # 11. Список тем
     elif data == "adm:list_topics":
         bot.answer_callback_query(call.id)
         reload_cache()
@@ -870,7 +919,7 @@ def handle_callbacks(call: types.CallbackQuery):
         kb.add(types.InlineKeyboardButton("◀️ В главное меню", callback_data="adm:main_menu"))
         bot.edit_message_text(text, chat_id=chat_id, message_id=msg_id, parse_mode='HTML', reply_markup=kb)
 
-    # 11. Детальная статистика
+    # 12. Детальная статистика
     elif data == "adm:stats":
         bot.answer_callback_query(call.id)
         reload_cache()
@@ -883,10 +932,11 @@ def handle_callbacks(call: types.CallbackQuery):
             "📊 <b>Детальная статистика Cleaner Bot:</b>\n\n"
             f"🕒 <b>Аптайм бота:</b> <code>{uptime_str}</code>\n"
             f"🗑 <b>Всего сообщений удалено:</b> <code>{get_deleted_stat()}</code>\n"
-            f"⏳ <b>В очереди на удаление (по таймеру):</b> <code>{pending_db}</code>\n"
+            f"⏳ <b>Постов в очереди (по таймеру):</b> <code>{pending_db}</code>\n"
             f"⚡ <b>Активных таймеров в RAM:</b> <code>{active_ram_timers}</code>\n"
             f"🗂 <b>Количество тем:</b> <code>{len(TRACKED_TOPICS)}</code>\n"
-            f"⏱ <b>Текущий таймер:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>"
+            f"⏱ <b>Текущий таймер:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>\n"
+            f"📝 <b>Порог оффтопа:</b> <code>≤ {OFFTOP_MAX_WORDS} слов</code>"
         )
         kb = types.InlineKeyboardMarkup()
         kb.add(
@@ -898,7 +948,7 @@ def handle_callbacks(call: types.CallbackQuery):
         except Exception:
             pass
 
-    # 12. Подтверждение очистки очереди
+    # 13. Подтверждение очистки очереди
     elif data == "adm:purge_confirm":
         pending_count = db_count_pending()
         bot.answer_callback_query(call.id)
@@ -917,7 +967,7 @@ def handle_callbacks(call: types.CallbackQuery):
             reply_markup=kb
         )
 
-    # 13. Выполнение очистки очереди
+    # 14. Выполнение очистки очереди
     elif data == "adm:purge_exec":
         bot.answer_callback_query(call.id, "🧹 Запуск очистки...")
 
@@ -972,23 +1022,36 @@ def handle_group_message(message: types.Message):
 
     text = message.text or message.caption or ""
 
-    # ПРАВИЛО: Сообщения с хэштегом # (например #страна, #ход, #приказ, #газета) НЕ УДАЛЯЮТСЯ!
+    # ПРАВИЛО 1: Сообщения с хэштегом # (например #страна, #ход, #приказ, #газета) НЕ УДАЛЯЮТСЯ НИКОГДА!
     if '#' in text:
         return
 
-    # Сообщения БЕЗ # (включая текст, стикеры, гифки, фото, видео) планируются на удаление по таймеру!
     user_name = f"@{message.from_user.username}" if message.from_user and message.from_user.username else f"ID: {message.from_user.id if message.from_user else 'Unknown'}"
     snippet = (text[:60] + "...") if len(text) > 60 else (text or f"[{message.content_type.upper()}]")
+    words = text.split() if text else []
+    word_count = len(words)
 
-    schedule_deletion(
-        chat_id=chat_id,
-        message_id=message.message_id,
-        thread_id=thread_id,
-        delay_seconds=RP_TIMER_SECONDS,
-        user_info=user_name,
-        snippet=snippet,
-        persist=True
-    )
+    # ПРАВИЛО 2: ОФФТОП (СТИКЕРЫ, ГИФКИ, МЕДИА БЕЗ ТЕКСТА И КОРОТКИЕ СООБЩЕНИЯ ≤ 10 СЛОВ) УДАЛЯЮТСЯ МГНОВЕННО!
+    if message.content_type in ('sticker', 'animation', 'video_note', 'poll') or word_count <= OFFTOP_MAX_WORDS:
+        success = delete_message_safe(chat_id, message.message_id)
+        if success:
+            matched_id = thread_id if thread_id is not None else "Основная"
+            log_event(
+                f"🗑 <b>[Оффтоп Мгновенно]</b> В теме <code>{matched_id}</code> удален оффтоп от <b>{user_name}</b> "
+                f"(слов: {word_count}):\n<i>«{snippet}»</i>"
+            )
+
+    # ПРАВИЛО 3: ДЛИННЫЕ ПОСТЫ (> 10 СЛОВ) БЕЗ # СТАВЯТСЯ НА ТАЙМЕР (40 МИНУТ)
+    else:
+        schedule_deletion(
+            chat_id=chat_id,
+            message_id=message.message_id,
+            thread_id=thread_id,
+            delay_seconds=RP_TIMER_SECONDS,
+            user_info=user_name,
+            snippet=snippet,
+            persist=True
+        )
 
 
 @bot.edited_message_handler(
@@ -1005,26 +1068,34 @@ def handle_group_edited_message(message: types.Message):
 
     # Если пользователь отредактировал сообщение и ДОБАВИЛ хэштег #
     if '#' in text:
-        # Моментально гасим таймер и удаляем из БД
+        # Моментально гасим таймер и удаляем из БД — сообщение сохранено навсегда!
         cancel_scheduled_deletion(chat_id, message.message_id)
         matched_id = thread_id if thread_id is not None else "Основная"
-        log_event(f"🛡 <b>[Сообщение сохранено]</b> Сообщение {message.message_id} в теме <code>{matched_id}</code> от <b>{user_name}</b> сохранено (добавлен хэштег #).")
+        log_event(f"🛡 <b>[Пост сохранен]</b> Сообщение {message.message_id} в теме <code>{matched_id}</code> от <b>{user_name}</b> сохранено навсегда (добавлен хэштег #).")
 
     # Если пользователь отредактировал сообщение и УБРАЛ хэштег #
     else:
         if is_topic_monitored(chat_id, thread_id):
-            if not db_is_pending(chat_id, message.message_id):
-                schedule_deletion(
-                    chat_id=chat_id,
-                    message_id=message.message_id,
-                    thread_id=thread_id,
-                    delay_seconds=RP_TIMER_SECONDS,
-                    user_info=user_name,
-                    snippet=snippet,
-                    persist=True
-                )
-                matched_id = thread_id if thread_id is not None else "Основная"
-                log_event(f"⏱ <b>[Таймер запущен]</b> Запущен таймер удаления для сообщения {message.message_id} в теме <code>{matched_id}</code> от <b>{user_name}</b> (убран хэштег #).")
+            words = text.split() if text else []
+            word_count = len(words)
+
+            # Если после редактирования стало коротким оффтопом — удаляем сразу
+            if message.content_type in ('sticker', 'animation', 'video_note', 'poll') or word_count <= OFFTOP_MAX_WORDS:
+                delete_message_safe(chat_id, message.message_id)
+            else:
+                # Если длинный пост без # — запускаем таймер
+                if not db_is_pending(chat_id, message.message_id):
+                    schedule_deletion(
+                        chat_id=chat_id,
+                        message_id=message.message_id,
+                        thread_id=thread_id,
+                        delay_seconds=RP_TIMER_SECONDS,
+                        user_info=user_name,
+                        snippet=snippet,
+                        persist=True
+                    )
+                    matched_id = thread_id if thread_id is not None else "Основная"
+                    log_event(f"⏱ <b>[Таймер запущен]</b> Запущен таймер удаления для сообщения {message.message_id} в теме <code>{matched_id}</code> от <b>{user_name}</b> (убран хэштег #).")
 
 # =====================================================================
 #  ТОЧКА ВХОДА И ЦИКЛ ЗАПУСКА С АВТОВОССТАНОВЛЕНИЕМ
@@ -1040,7 +1111,8 @@ def main():
     print(f"  • Лог-чат: {LOG_CHAT_ID}")
     print(f"  • База данных: {DB_PATH}")
     print(f"  • Темы очистки: {sorted(TRACKED_TOPICS) or 'нет'}")
-    print(f"  • Таймер удаления: {format_seconds(RP_TIMER_SECONDS)}")
+    print(f"  • Таймер длинных постов: {format_seconds(RP_TIMER_SECONDS)}")
+    print(f"  • Порог оффтопа: ≤ {OFFTOP_MAX_WORDS} слов, стикеры, GIF")
 
     start_health_check_server()
     restore_queue_on_startup()
@@ -1050,7 +1122,8 @@ def main():
 
     log_event(
         f"🚀 <b>Cleaner Bot успешно запущен!</b>\n\n"
-        f"⏱ <b>Таймер удаления:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>\n"
+        f"⏱ <b>Таймер постов без #:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>\n"
+        f"📝 <b>Оффтоп (мгновенно):</b> <code>≤ {OFFTOP_MAX_WORDS} слов, стикеры, GIF</code>\n"
         f"🗂 <b>Отслеживаемые темы:</b> <code>{sorted(TRACKED_TOPICS) or '—'}</code>"
     )
 
