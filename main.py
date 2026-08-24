@@ -22,7 +22,7 @@ from telebot.apihelper import ApiTelegramException
 
 TOKEN = os.getenv('BOT_TOKEN', '').strip()
 
-# ID администратора (только ты имеешь доступ к управлению)
+# ID главного администратора (только ты имеешь доступ к управлению)
 ADMIN_IDS: Set[int] = {7930482209}
 
 env_admin = os.getenv('ADMIN_ID', '').strip()
@@ -102,6 +102,8 @@ def init_db():
             thread_id INTEGER,
             delete_at REAL NOT NULL,
             created_at REAL NOT NULL,
+            user_info TEXT,
+            snippet TEXT,
             PRIMARY KEY (chat_id, message_id)
         );
         """)
@@ -114,7 +116,7 @@ def init_db():
         conn.execute("""
         CREATE TABLE IF NOT EXISTS topics (
             topic_id INTEGER PRIMARY KEY,
-            type TEXT NOT NULL
+            type TEXT NOT NULL  -- 'rp' (по таймеру) или 'offtop' (мгновенно)
         );
         """)
         conn.execute("""
@@ -126,7 +128,7 @@ def init_db():
 
         conn.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('deleted_total', 0);")
         conn.execute("INSERT OR IGNORE INTO stats (key, value) VALUES ('started_at', ?);", (int(time.time()),))
-        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('rp_timer_seconds', '2400');")
+        conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('rp_timer_seconds', '2400');")  # 40 минут по умолчанию
         conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('offtop_min_words', '1');")
         conn.execute("INSERT OR IGNORE INTO config (key, value) VALUES ('offtop_max_words', '10');")
 
@@ -199,12 +201,12 @@ def get_deleted_stat() -> int:
         return int(row[0]) if row else 0
 
 
-def db_add_pending(chat_id: int, message_id: int, thread_id: Optional[int], delete_at: float):
+def db_add_pending(chat_id: int, message_id: int, thread_id: Optional[int], delete_at: float, user_info: str = "", snippet: str = ""):
     with db_lock, db_conn() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO pending_deletions (chat_id, message_id, thread_id, delete_at, created_at) "
-            "VALUES (?, ?, ?, ?, ?)",
-            (chat_id, message_id, thread_id, delete_at, time.time())
+            "INSERT OR REPLACE INTO pending_deletions (chat_id, message_id, thread_id, delete_at, created_at, user_info, snippet) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, message_id, thread_id, delete_at, time.time(), user_info, snippet)
         )
         conn.commit()
 
@@ -215,9 +217,9 @@ def db_remove_pending(chat_id: int, message_id: int):
         conn.commit()
 
 
-def db_all_pending() -> List[Tuple[int, int, Optional[int], float]]:
+def db_all_pending() -> List[Tuple[int, int, Optional[int], float, str, str]]:
     with db_lock, db_conn() as conn:
-        return conn.execute("SELECT chat_id, message_id, thread_id, delete_at FROM pending_deletions ORDER BY delete_at ASC").fetchall()
+        return conn.execute("SELECT chat_id, message_id, thread_id, delete_at, user_info, snippet FROM pending_deletions ORDER BY delete_at ASC").fetchall()
 
 
 def db_count_pending() -> int:
@@ -226,9 +228,9 @@ def db_count_pending() -> int:
         return int(row[0]) if row else 0
 
 
-def db_get_expired_pending(now_ts: float) -> List[Tuple[int, int]]:
+def db_get_expired_pending(now_ts: float) -> List[Tuple[int, int, Optional[int], str, str]]:
     with db_lock, db_conn() as conn:
-        return conn.execute("SELECT chat_id, message_id FROM pending_deletions WHERE delete_at <= ?", (now_ts,)).fetchall()
+        return conn.execute("SELECT chat_id, message_id, thread_id, user_info, snippet FROM pending_deletions WHERE delete_at <= ?", (now_ts,)).fetchall()
 
 
 def db_clear_all_pending() -> List[Tuple[int, int]]:
@@ -266,7 +268,7 @@ def match_topic_rule(chat_id: int, thread_id: Optional[int]) -> Tuple[Optional[s
         rp_s = RP_TOPICS
         off_s = OFFTOP_TOPICS
 
-    # 1. Прямой поиск по номеру темы
+    # 1. Прямой поиск по номеру темы (thread_id)
     if thread_id is not None:
         if thread_id in rp_s:
             return 'rp', thread_id
@@ -383,15 +385,22 @@ def delete_message_safe(chat_id: int, message_id: int) -> bool:
             active_timers.pop((chat_id, message_id), None)
 
 
-def schedule_deletion(chat_id: int, message_id: int, thread_id: Optional[int], delay_seconds: float, persist: bool = True):
+def schedule_deletion(chat_id: int, message_id: int, thread_id: Optional[int], delay_seconds: float,
+                      user_info: str = "", snippet: str = "", persist: bool = True):
     key = (chat_id, message_id)
     delete_at = time.time() + max(0.0, delay_seconds)
 
     if persist:
-        db_add_pending(chat_id, message_id, thread_id, delete_at)
+        db_add_pending(chat_id, message_id, thread_id, delete_at, user_info, snippet)
 
     def _timer_callback():
-        delete_message_safe(chat_id, message_id)
+        success = delete_message_safe(chat_id, message_id)
+        if success:
+            matched_id = thread_id if thread_id is not None else "Основная"
+            log_event(
+                f"🗑 <b>[РП Удаление по таймеру]</b> В теме <code>{matched_id}</code> удалено сообщение от <b>{user_info or 'Unknown'}</b> "
+                f"(таймер {format_seconds(int(delay_seconds))} истёк):\n<i>«{snippet}»</i>"
+            )
 
     with timers_lock:
         old_timer = active_timers.pop(key, None)
@@ -419,18 +428,19 @@ def restore_queue_on_startup():
     restored_count = 0
     fired_now_count = 0
 
-    for chat_id, message_id, thread_id, delete_at in rows:
+    for chat_id, message_id, thread_id, delete_at, user_info, snippet in rows:
         remaining = delete_at - now
         if remaining <= 0:
-            delete_message_safe(chat_id, message_id)
-            fired_now_count += 1
+            success = delete_message_safe(chat_id, message_id)
+            if success:
+                fired_now_count += 1
         else:
-            schedule_deletion(chat_id, message_id, thread_id, remaining, persist=False)
+            schedule_deletion(chat_id, message_id, thread_id, remaining, user_info=user_info, snippet=snippet, persist=False)
             restored_count += 1
 
     if rows:
         log_event(
-            f"🔄 <b>Восстановление после рестарта:</b>\n"
+            f"🔄 <b>Восстановление очереди после рестарта:</b>\n"
             f"• Возобновлено таймеров: <code>{restored_count}</code>\n"
             f"• Просроченных удалено сразу: <code>{fired_now_count}</code>"
         )
@@ -443,8 +453,13 @@ def watchdog_background_worker():
             now = time.time()
             expired = db_get_expired_pending(now)
             if expired:
-                for chat_id, message_id in expired:
-                    delete_message_safe(chat_id, message_id)
+                for chat_id, message_id, thread_id, user_info, snippet in expired:
+                    success = delete_message_safe(chat_id, message_id)
+                    if success:
+                        matched_id = thread_id if thread_id is not None else "Основная"
+                        log_event(
+                            f"🗑 <b>[Watchdog Удаление]</b> В теме <code>{matched_id}</code> удалено просроченное сообщение от <b>{user_info or 'Unknown'}</b>:\n<i>«{snippet}»</i>"
+                        )
                     time.sleep(0.05)
         except Exception as e:
             print(f"[{get_current_time_str()}] Ошибка в watchdog_worker: {e}")
@@ -458,8 +473,8 @@ def build_admin_main_text() -> str:
     rp_sorted = sorted(RP_TOPICS)
     offtop_sorted = sorted(OFFTOP_TOPICS)
 
-    rp_str = ", ".join(f"<code>{tid}</code>" for tid in rp_sorted) if rp_sorted else "<i>нет тем (добавьте через меню)</i>"
-    offtop_str = ", ".join(f"<code>{tid}</code>" for tid in offtop_sorted) if offtop_sorted else "<i>нет тем (добавьте через меню)</i>"
+    rp_str = ", ".join(f"<code>{tid}</code>" for tid in rp_sorted) if rp_sorted else "<i>нет тем (напишите /rp в теме)</i>"
+    offtop_str = ", ".join(f"<code>{tid}</code>" for tid in offtop_sorted) if offtop_sorted else "<i>нет тем</i>"
 
     pending_cnt = db_count_pending()
     deleted_cnt = get_deleted_stat()
@@ -468,13 +483,13 @@ def build_admin_main_text() -> str:
     text = (
         "🤖 <b>Панель управления Cleaner Bot</b>\n\n"
         f"⚡ <b>Статус:</b> <code>Активен 🟢</code> | <b>Аптайм:</b> <code>{uptime_str}</code>\n"
-        f"⏱ <b>Таймер RP:</b> <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n"
-        f"📝 <b>Лимит Оффтопа:</b> <code>{OFFTOP_MIN_WORDS} – {OFFTOP_MAX_WORDS} слов</code>\n\n"
-        f"🗂 <b>РП-темы:</b> {rp_str}\n"
-        f"🗑 <b>Оффтоп-темы:</b> {offtop_str}\n\n"
-        f"⏳ <b>В очереди на удаление:</b> <code>{pending_cnt}</code> сообщений\n"
+        f"⏱ <b>Таймер удаления RP:</b> <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n"
+        f"📝 <b>Фильтр Оффтопа:</b> <code>{OFFTOP_MIN_WORDS} – {OFFTOP_MAX_WORDS} слов</code>\n\n"
+        f"🗂 <b>РП-темы (удаление без # через {format_seconds(RP_TIMER_SECONDS)}):</b>\n{rp_str}\n\n"
+        f"🗑 <b>Оффтоп-темы (мгновенное удаление коротких):</b>\n{offtop_str}\n\n"
+        f"⏳ <b>В очереди на удаление (по таймеру):</b> <code>{pending_cnt}</code> сообщений\n"
         f"📊 <b>Всего удалено за все время:</b> <code>{deleted_cnt}</code>\n\n"
-        "💡 <i>Совет: Вы можете написать <code>/offtop</code> или <code>/rp</code> прямо внутри нужной темы в группе!</i>"
+        "💡 <i>Совет: Чтобы включить автоудаление по таймеру в теме, напишите прямо в ней <code>/rp</code>!</i>"
     )
     return text
 
@@ -486,8 +501,8 @@ def build_admin_main_keyboard() -> types.InlineKeyboardMarkup:
         types.InlineKeyboardButton("🧹 Очистить очередь", callback_data="adm:purge_confirm"),
     )
     kb.add(
-        types.InlineKeyboardButton("➕ РП-тема", callback_data="adm:add_rp"),
-        types.InlineKeyboardButton("➕ Офтоп-тема", callback_data="adm:add_offtop"),
+        types.InlineKeyboardButton("➕ Добавить РП-тему", callback_data="adm:add_rp"),
+        types.InlineKeyboardButton("➕ Добавить Офтоп", callback_data="adm:add_offtop"),
     )
     kb.add(
         types.InlineKeyboardButton("➖ Удалить тему", callback_data="adm:remove_menu"),
@@ -515,7 +530,7 @@ def build_remove_topics_keyboard() -> types.InlineKeyboardMarkup:
     all_topics = get_topics_from_db()
 
     for tid, ttype in all_topics:
-        icon = "🗂 РП" if ttype == 'rp' else "🗑 Оффтоп"
+        icon = "🗂 РП (Таймер)" if ttype == 'rp' else "🗑 Оффтоп (Мгнов.)"
         kb.add(types.InlineKeyboardButton(f"❌ {icon}: {tid}", callback_data=f"adm:del_topic:{tid}"))
 
     kb.add(types.InlineKeyboardButton("✍️ Ввести ID темы вручную", callback_data="adm:remove_manual"))
@@ -526,7 +541,7 @@ def build_remove_topics_keyboard() -> types.InlineKeyboardMarkup:
 #  КОМАНДЫ АДМИНИСТРАТОРА В ЧАТАХ И ТЕМАХ
 # =====================================================================
 
-@bot.message_handler(commands=['id', 'topic', 'add_rp', 'add_offtop', 'rp', 'offtop'])
+@bot.message_handler(commands=['id', 'topic', 'add_rp', 'add_offtop', 'rp', 'offtop', 'track', 'clean'])
 def handle_in_chat_admin_commands(message: types.Message):
     user_id = message.from_user.id if message.from_user else 0
     if not is_admin(user_id):
@@ -537,8 +552,8 @@ def handle_in_chat_admin_commands(message: types.Message):
     thread_id = message.message_thread_id
     effective_topic_id = thread_id if thread_id is not None else 1
 
-    # Команда добавления в RP
-    if cmd in ('add_rp', 'rp'):
+    # Добавление в РП (удаление по таймеру)
+    if cmd in ('add_rp', 'rp', 'track', 'clean'):
         add_topic_to_db(effective_topic_id, 'rp')
         reload_cache()
         try:
@@ -547,15 +562,16 @@ def handle_in_chat_admin_commands(message: types.Message):
             pass
         temp_msg = bot.send_message(
             chat_id,
-            f"✅ <b>Тема ID <code>{effective_topic_id}</code> успешно добавлена в список РП!</b>\n"
-            f"<i>(Сообщения без # будут удаляться через {format_seconds(RP_TIMER_SECONDS)})</i>",
+            f"✅ <b>Тема ID <code>{effective_topic_id}</code> успешно привязана как РП-ТЕМА!</b>\n\n"
+            f"⏱ Сообщения <b>без #</b> будут автоматически удаляться через <b>{format_seconds(RP_TIMER_SECONDS)}</b>.\n"
+            f"🛡 Сообщения <b>с #</b> (например: <code>#страна</code>, <code>#ход</code>, <code>#приказ</code>) сохраняются навсегда!",
             message_thread_id=thread_id,
             parse_mode='HTML'
         )
-        log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{effective_topic_id}</code> в <b>РП</b> прямо из чата {chat_id}.")
-        threading.Timer(7.0, lambda: delete_message_safe(chat_id, temp_msg.message_id)).start()
+        log_event(f"➕ <b>Админ [ID: {user_id}]</b> сделал тему <code>{effective_topic_id}</code> <b>РП-темой (Таймер {format_seconds(RP_TIMER_SECONDS)})</b>.")
+        threading.Timer(8.0, lambda: delete_message_safe(chat_id, temp_msg.message_id)).start()
 
-    # Команда добавления в Оффтоп
+    # Добавление в Оффтоп (мгновенное удаление)
     elif cmd in ('add_offtop', 'offtop'):
         add_topic_to_db(effective_topic_id, 'offtop')
         reload_cache()
@@ -565,15 +581,16 @@ def handle_in_chat_admin_commands(message: types.Message):
             pass
         temp_msg = bot.send_message(
             chat_id,
-            f"✅ <b>Тема ID <code>{effective_topic_id}</code> успешно добавлена в список ОФФТОП!</b>\n"
-            f"<i>(Короткие сообщения от {OFFTOP_MIN_WORDS} до {OFFTOP_MAX_WORDS} слов без # удаляются мгновенно)</i>",
+            f"✅ <b>Тема ID <code>{effective_topic_id}</code> привязана как ОФФТОП!</b>\n\n"
+            f"⚡ Короткие сообщения ({OFFTOP_MIN_WORDS}–{OFFTOP_MAX_WORDS} слов) без <code>#</code> удаляются <b>мгновенно</b>.\n"
+            f"<i>(Если вы хотите удаление по таймеру {format_seconds(RP_TIMER_SECONDS)}, напишите команду <code>/rp</code>)</i>",
             message_thread_id=thread_id,
             parse_mode='HTML'
         )
-        log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{effective_topic_id}</code> в <b>Оффтоп</b> прямо из чата {chat_id}.")
-        threading.Timer(7.0, lambda: delete_message_safe(chat_id, temp_msg.message_id)).start()
+        log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{effective_topic_id}</code> в <b>Оффтоп (Мгновенный)</b>.")
+        threading.Timer(8.0, lambda: delete_message_safe(chat_id, temp_msg.message_id)).start()
 
-    # Команда информации о теме (/id, /topic)
+    # Информация о теме
     elif cmd in ('id', 'topic'):
         try:
             bot.delete_message(chat_id, message.message_id)
@@ -581,15 +598,18 @@ def handle_in_chat_admin_commands(message: types.Message):
             pass
         kb = types.InlineKeyboardMarkup()
         kb.add(
-            types.InlineKeyboardButton("➕ Сделать РП", callback_data=f"adm:quick_add_rp:{effective_topic_id}"),
-            types.InlineKeyboardButton("➕ Сделать Оффтоп", callback_data=f"adm:quick_add_off:{effective_topic_id}"),
+            types.InlineKeyboardButton(f"⏱ Сделать РП (Таймер {format_seconds(RP_TIMER_SECONDS)})", callback_data=f"adm:quick_add_rp:{effective_topic_id}"),
+        )
+        kb.add(
+            types.InlineKeyboardButton("⚡ Сделать Оффтоп (Мгновенно)", callback_data=f"adm:quick_add_off:{effective_topic_id}"),
         )
         kb.add(types.InlineKeyboardButton("❌ Закрыть", callback_data="adm:close_temp"))
         bot.send_message(
             chat_id,
-            f"ℹ️ <b>Информация о текущей ветке:</b>\n"
+            f"ℹ️ <b>Информация о ветке:</b>\n"
             f"• Чат ID: <code>{chat_id}</code>\n"
-            f"• Тема ID (thread_id): <code>{effective_topic_id}</code>",
+            f"• ID темы (thread_id): <code>{effective_topic_id}</code>\n\n"
+            f"<i>Выберите режим для этой темы:</i>",
             message_thread_id=thread_id,
             parse_mode='HTML',
             reply_markup=kb
@@ -629,16 +649,16 @@ def handle_admin_text_input(message: types.Message):
         bot.send_message(message.chat.id, "❌ Действие отменено.", reply_markup=build_admin_main_keyboard())
         return
 
-    # 1. Таймер RP
+    # 1. Изменение таймера RP
     if action == 'set_timer':
         try:
             val_str = text.replace(',', '.')
             minutes = float(val_str)
             if minutes <= 0:
-                raise ValueError("Время должно быть положительным")
+                raise ValueError
             seconds = int(minutes * 60)
             if seconds < 5:
-                bot.send_message(message.chat.id, "❌ Минимальный таймер: 5 секунд (0.1 мин). Попробуйте еще раз:")
+                bot.send_message(message.chat.id, "❌ Минимальный таймер: 5 секунд. Введите число минут:")
                 with states_lock:
                     admin_states[user_id] = {'action': 'set_timer'}
                 return
@@ -652,7 +672,7 @@ def handle_admin_text_input(message: types.Message):
         except ValueError:
             bot.send_message(
                 message.chat.id,
-                "❌ Некорректное число минут! Введите положительное число (например: <code>10</code> или <code>2.5</code>):",
+                "❌ Некорректное число минут! Введите положительное число (например: <code>10</code> или <code>40</code>):",
                 parse_mode='HTML',
                 reply_markup=build_cancel_keyboard()
             )
@@ -668,12 +688,12 @@ def handle_admin_text_input(message: types.Message):
 
             bot.send_message(
                 message.chat.id,
-                f"✅ <b>Тема {topic_id} успешно добавлена в список RP!</b>\n"
-                f"Сообщения без <code>#</code> в этой теме будут удаляться через <b>{format_seconds(RP_TIMER_SECONDS)}</b>.",
+                f"✅ <b>Тема {topic_id} успешно добавлена в список РП!</b>\n"
+                f"Сообщения без <code>#</code> в ней будут удаляться через <b>{format_seconds(RP_TIMER_SECONDS)}</b>.",
                 parse_mode='HTML',
                 reply_markup=build_admin_main_keyboard()
             )
-            log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{topic_id}</code> в <b>RP</b>.")
+            log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{topic_id}</code> в <b>РП (Таймер {format_seconds(RP_TIMER_SECONDS)})</b>.")
         except ValueError:
             bot.send_message(
                 message.chat.id,
@@ -693,8 +713,7 @@ def handle_admin_text_input(message: types.Message):
 
             bot.send_message(
                 message.chat.id,
-                f"✅ <b>Тема {topic_id} успешно добавлена в список ОФФТОП!</b>\n"
-                f"Короткие сообщения ({OFFTOP_MIN_WORDS}-{OFFTOP_MAX_WORDS} слов) без <code>#</code> удаляются мгновенно.",
+                f"✅ <b>Тема {topic_id} успешно добавлена в список ОФФТОП (мгновенное удаление)!</b>",
                 parse_mode='HTML',
                 reply_markup=build_admin_main_keyboard()
             )
@@ -755,7 +774,7 @@ def handle_admin_text_input(message: types.Message):
 
         bot.send_message(
             message.chat.id,
-            "❌ Неверный формат! Введите два числа через пробел (минимум и максимум, например: <code>1 10</code> или <code>0 5</code>):",
+            "❌ Неверный формат! Введите два числа через пробел (например: <code>1 10</code>):",
             parse_mode='HTML',
             reply_markup=build_cancel_keyboard()
         )
@@ -782,26 +801,26 @@ def handle_callbacks(call: types.CallbackQuery):
         tid = int(data.split(":")[-1])
         add_topic_to_db(tid, 'rp')
         reload_cache()
-        bot.answer_callback_query(call.id, f"✅ Тема {tid} добавлена в РП!")
+        bot.answer_callback_query(call.id, f"✅ Тема {tid} привязана к РП (Таймер {format_seconds(RP_TIMER_SECONDS)})!")
         try:
-            bot.edit_message_text(f"✅ <b>Тема ID {tid} добавлена в список РП!</b>", chat_id=chat_id, message_id=msg_id, parse_mode='HTML')
+            bot.edit_message_text(f"✅ <b>Тема ID {tid} привязана как РП-ТЕМА!</b>\nУдаление сообщений без # через {format_seconds(RP_TIMER_SECONDS)}.", chat_id=chat_id, message_id=msg_id, parse_mode='HTML')
             threading.Timer(5.0, lambda: delete_message_safe(chat_id, msg_id)).start()
         except Exception:
             pass
-        log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{tid}</code> в <b>РП</b>.")
+        log_event(f"➕ <b>Админ [ID: {user_id}]</b> привязал тему <code>{tid}</code> как <b>РП (Таймер {format_seconds(RP_TIMER_SECONDS)})</b>.")
         return
 
     elif data.startswith("adm:quick_add_off:"):
         tid = int(data.split(":")[-1])
         add_topic_to_db(tid, 'offtop')
         reload_cache()
-        bot.answer_callback_query(call.id, f"✅ Тема {tid} добавлена в Оффтоп!")
+        bot.answer_callback_query(call.id, f"✅ Тема {tid} привязана к Оффтопу (Мгновенно)!")
         try:
-            bot.edit_message_text(f"✅ <b>Тема ID {tid} добавлена в список ОФФТОП!</b>", chat_id=chat_id, message_id=msg_id, parse_mode='HTML')
+            bot.edit_message_text(f"✅ <b>Тема ID {tid} привязана как ОФФТОП (Мгновенное удаление)!</b>", chat_id=chat_id, message_id=msg_id, parse_mode='HTML')
             threading.Timer(5.0, lambda: delete_message_safe(chat_id, msg_id)).start()
         except Exception:
             pass
-        log_event(f"➕ <b>Админ [ID: {user_id}]</b> добавил тему <code>{tid}</code> в <b>Оффтоп</b>.")
+        log_event(f"➕ <b>Админ [ID: {user_id}]</b> привязал тему <code>{tid}</code> как <b>Оффтоп</b>.")
         return
 
     elif data == "adm:close_temp":
@@ -859,7 +878,7 @@ def handle_callbacks(call: types.CallbackQuery):
         bot.edit_message_text(
             f"⏱ <b>Настройка таймера RP-тем</b>\n\n"
             f"Текущее значение: <b>{format_seconds(RP_TIMER_SECONDS)}</b>\n\n"
-            f"Пришлите новое время в <b>минутах</b> (например: <code>10</code>, <code>40</code> или <code>0.5</code>):",
+            f"Пришлите новое время в <b>минутах</b> (например: <code>10</code> или <code>40</code>):",
             chat_id=chat_id,
             message_id=msg_id,
             parse_mode='HTML',
@@ -872,10 +891,10 @@ def handle_callbacks(call: types.CallbackQuery):
             admin_states[user_id] = {'action': 'add_rp'}
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
-            f"➕ <b>Добавление RP-темы</b>\n\n"
+            f"➕ <b>Добавление RP-темы (Удаление по таймеру)</b>\n\n"
             f"Пришлите <b>ID темы (thread_id)</b> форума:\n"
             f"<i>(Сообщения без # в ней будут удаляться через {format_seconds(RP_TIMER_SECONDS)})</i>\n\n"
-            f"💡 <i>Или просто напишите <code>/rp</code> прямо внутри нужной темы в группе!</i>",
+            f"💡 <i>Или просто напишите команду <code>/rp</code> прямо внутри нужной темы в группе!</i>",
             chat_id=chat_id,
             message_id=msg_id,
             parse_mode='HTML',
@@ -888,10 +907,9 @@ def handle_callbacks(call: types.CallbackQuery):
             admin_states[user_id] = {'action': 'add_offtop'}
         bot.answer_callback_query(call.id)
         bot.edit_message_text(
-            f"➕ <b>Добавление Оффтоп-темы</b>\n\n"
+            f"➕ <b>Добавление Оффтоп-темы (Мгновенное удаление)</b>\n\n"
             f"Пришлите <b>ID темы (thread_id)</b> форума:\n"
-            f"<i>(Короткие сообщения от {OFFTOP_MIN_WORDS} до {OFFTOP_MAX_WORDS} слов без # будут удаляться сразу)</i>\n\n"
-            f"💡 <i>Или просто напишите <code>/offtop</code> прямо внутри нужной темы в группе!</i>",
+            f"<i>(Короткие сообщения от {OFFTOP_MIN_WORDS} до {OFFTOP_MAX_WORDS} слов без # будут удаляться сразу)</i>",
             chat_id=chat_id,
             message_id=msg_id,
             parse_mode='HTML',
@@ -906,7 +924,7 @@ def handle_callbacks(call: types.CallbackQuery):
             kb = types.InlineKeyboardMarkup()
             kb.add(types.InlineKeyboardButton("◀️ Назад", callback_data="adm:main_menu"))
             bot.edit_message_text(
-                "ℹ️ <b>Список тем пуст!</b> Сначала добавьте РП или Оффтоп тему.",
+                "ℹ️ <b>Список тем пуст!</b> Сначала добавьте тему (напишите <code>/rp</code> в нужной теме группы).",
                 chat_id=chat_id,
                 message_id=msg_id,
                 parse_mode='HTML',
@@ -965,7 +983,7 @@ def handle_callbacks(call: types.CallbackQuery):
 
         text = (
             "📋 <b>Список отслеживаемых тем:</b>\n\n"
-            f"🗂 <b>РП-темы (автоудаление через {format_seconds(RP_TIMER_SECONDS)}):</b>\n{rp_list}\n\n"
+            f"🗂 <b>РП-темы (удаление без # через {format_seconds(RP_TIMER_SECONDS)}):</b>\n{rp_list}\n\n"
             f"🗑 <b>Оффтоп-темы (мгновенно, {OFFTOP_MIN_WORDS}-{OFFTOP_MAX_WORDS} слов):</b>\n{offtop_list}"
         )
         kb = types.InlineKeyboardMarkup(row_width=2)
@@ -984,7 +1002,7 @@ def handle_callbacks(call: types.CallbackQuery):
         bot.edit_message_text(
             f"⚙️ <b>Настройка лимитов слов для Оффтопа</b>\n\n"
             f"Текущие лимиты: от <b>{OFFTOP_MIN_WORDS}</b> до <b>{OFFTOP_MAX_WORDS}</b> слов.\n\n"
-            f"Пришлите два числа через пробел (минимум и максимум), например: <code>1 10</code> или <code>0 5</code>:",
+            f"Пришлите два числа через пробел (минимум и максимум), например: <code>1 10</code>:",
             chat_id=chat_id,
             message_id=msg_id,
             parse_mode='HTML',
@@ -1004,11 +1022,11 @@ def handle_callbacks(call: types.CallbackQuery):
             "📊 <b>Детальная статистика Cleaner Bot:</b>\n\n"
             f"🕒 <b>Аптайм бота:</b> <code>{uptime_str}</code>\n"
             f"🗑 <b>Всего сообщений удалено:</b> <code>{get_deleted_stat()}</code>\n"
-            f"⏳ <b>В очереди на удаление (SQLite):</b> <code>{pending_db}</code>\n"
+            f"⏳ <b>В очереди на удаление (по таймеру):</b> <code>{pending_db}</code>\n"
             f"⚡ <b>Активных таймеров в RAM:</b> <code>{active_ram_timers}</code>\n"
-            f"🗂 <b>Количество РП-тем:</b> <code>{len(RP_TOPICS)}</code>\n"
-            f"🗑 <b>Количество Оффтоп-тем:</b> <code>{len(OFFTOP_TOPICS)}</code>\n"
-            f"⏱ <b>Таймер RP:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>\n"
+            f"🗂 <b>Количество РП-тем (с таймером):</b> <code>{len(RP_TOPICS)}</code>\n"
+            f"🗑 <b>Количество Оффтоп-тем (мгновенных):</b> <code>{len(OFFTOP_TOPICS)}</code>\n"
+            f"⏱ <b>Текущий таймер RP:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>\n"
             f"📝 <b>Фильтр Оффтопа:</b> <code>{OFFTOP_MIN_WORDS} - {OFFTOP_MAX_WORDS} слов</code>"
         )
         kb = types.InlineKeyboardMarkup()
@@ -1027,13 +1045,13 @@ def handle_callbacks(call: types.CallbackQuery):
         bot.answer_callback_query(call.id)
         kb = types.InlineKeyboardMarkup()
         kb.add(
-            types.InlineKeyboardButton("🧹 ДА, УДАЛИТЬ ВСЁ", callback_data="adm:purge_exec"),
+            types.InlineKeyboardButton("🧹 ДА, УДАЛИТЬ ВСЁ СЕЙЧАС", callback_data="adm:purge_exec"),
             types.InlineKeyboardButton("❌ Отмена", callback_data="adm:main_menu")
         )
         bot.edit_message_text(
-            f"⚠️ <b>Подтверждение очистки очереди</b>\n\n"
-            f"В очереди сейчас находится <b>{pending_count}</b> сообщений.\n"
-            f"Вы действительно хотите принудительно удалить их прямо сейчас?",
+            f"⚠️ <b>Подтверждение экстренной очистки очереди</b>\n\n"
+            f"В очереди прямо сейчас: <b>{pending_count}</b> сообщений.\n"
+            f"Вы действительно хотите принудительно удалить их прямо сейчас из чатов?",
             chat_id=chat_id,
             message_id=msg_id,
             parse_mode='HTML',
@@ -1089,30 +1107,40 @@ def handle_group_message(message: types.Message):
     chat_id = message.chat.id
     thread_id = message.message_thread_id
 
+    # Определяем правило для этой темы: 'rp' (по таймеру) или 'offtop' (мгновенно)
     rule_type, matched_id = match_topic_rule(chat_id, thread_id)
     if not rule_type:
-        return
+        return  # Тема не отслеживается ботом
 
     text = message.text or message.caption or ""
 
-    # Хэштег # защищает сообщение от удаления
+    # ПРАВИЛО: Сообщения с хэштегом # (например #страна, #ход, #приказ) НЕ УДАЛЯЮТСЯ!
     if '#' in text:
         return
 
-    # 1. Правило для РП темы
-    if rule_type == 'rp':
-        schedule_deletion(chat_id, message.message_id, thread_id, RP_TIMER_SECONDS)
+    user_name = f"@{message.from_user.username}" if message.from_user and message.from_user.username else f"ID: {message.from_user.id if message.from_user else 'Unknown'}"
+    snippet = (text[:60] + "...") if len(text) > 60 else (text or "[Медиа/Стикер]")
 
-    # 2. Правило для Оффтоп темы
+    # 1. ПРАВИЛО РП-ТЕМЫ (УДАЛЕНИЕ ВСЕХ СООБЩЕНИЙ БЕЗ # ЧЕРЕЗ ТАЙМЕР 40 МИНУТ)
+    if rule_type == 'rp':
+        schedule_deletion(
+            chat_id=chat_id,
+            message_id=message.message_id,
+            thread_id=thread_id,
+            delay_seconds=RP_TIMER_SECONDS,
+            user_info=user_name,
+            snippet=snippet,
+            persist=True
+        )
+
+    # 2. ПРАВИЛО ОФФТОП-ТЕМЫ (МГНОВЕННОЕ УДАЛЕНИЕ КОРОТКИХ СООБЩЕНИЙ)
     elif rule_type == 'offtop':
         word_count = len(text.split()) if text else 0
         if OFFTOP_MIN_WORDS <= word_count <= OFFTOP_MAX_WORDS:
             success = delete_message_safe(chat_id, message.message_id)
             if success:
-                user_name = f"@{message.from_user.username}" if message.from_user and message.from_user.username else f"ID: {message.from_user.id if message.from_user else 'Unknown'}"
-                snippet = (text[:60] + "...") if len(text) > 60 else (text or "[Медиа/Стикер]")
                 log_event(
-                    f"🗑 <b>[Оффтоп Удаление]</b> В теме <code>{matched_id}</code> удалено сообщение от <b>{user_name}</b> "
+                    f"🗑 <b>[Оффтоп Мгновенно]</b> В теме <code>{matched_id}</code> удалено сообщение от <b>{user_name}</b> "
                     f"(слов: {word_count}):\n<i>«{snippet}»</i>"
                 )
 
@@ -1130,28 +1158,37 @@ def handle_group_edited_message(message: types.Message):
         return
 
     text = message.text or message.caption or ""
+    user_name = f"@{message.from_user.username}" if message.from_user and message.from_user.username else f"ID: {message.from_user.id if message.from_user else 'Unknown'}"
+    snippet = (text[:60] + "...") if len(text) > 60 else (text or "[Медиа/Стикер]")
 
+    # Если пользователь отредактировал сообщение и ДОБАВИЛ хэштег #
     if '#' in text:
         cancel_scheduled_deletion(chat_id, message.message_id)
+        if rule_type == 'rp':
+            log_event(f"🛡 <b>[РП Сохранено]</b> Сообщение {message.message_id} в теме <code>{matched_id}</code> от <b>{user_name}</b> сохранено (добавлен хэштег #).")
+
+    # Если пользователь отредактировал сообщение и УБРАЛ хэштег #
     else:
         if rule_type == 'rp':
             key = (chat_id, message.message_id)
             with timers_lock:
                 already_scheduled = key in active_timers
             if not already_scheduled:
-                schedule_deletion(chat_id, message.message_id, thread_id, RP_TIMER_SECONDS)
+                schedule_deletion(
+                    chat_id=chat_id,
+                    message_id=message.message_id,
+                    thread_id=thread_id,
+                    delay_seconds=RP_TIMER_SECONDS,
+                    user_info=user_name,
+                    snippet=snippet,
+                    persist=True
+                )
+                log_event(f"⏱ <b>[РП Таймер]</b> Запущен таймер удаления для сообщения {message.message_id} в теме <code>{matched_id}</code> от <b>{user_name}</b> (убран хэштег #).")
 
         elif rule_type == 'offtop':
             word_count = len(text.split()) if text else 0
             if OFFTOP_MIN_WORDS <= word_count <= OFFTOP_MAX_WORDS:
-                success = delete_message_safe(chat_id, message.message_id)
-                if success:
-                    user_name = f"@{message.from_user.username}" if message.from_user and message.from_user.username else f"ID: {message.from_user.id if message.from_user else 'Unknown'}"
-                    snippet = (text[:60] + "...") if len(text) > 60 else (text or "[Медиа/Стикер]")
-                    log_event(
-                        f"🗑 <b>[Оффтоп Редактирование]</b> В теме <code>{matched_id}</code> удалено сообщение от <b>{user_name}</b> "
-                        f"(слов: {word_count}):\n<i>«{snippet}»</i>"
-                    )
+                delete_message_safe(chat_id, message.message_id)
 
 # =====================================================================
 #  ТОЧКА ВХОДА И ЦИКЛ ЗАПУСКА С АВТОВОССТАНОВЛЕНИЕМ
@@ -1166,30 +1203,23 @@ def main():
     print(f"  • Админы: {sorted(ADMIN_IDS)}")
     print(f"  • Лог-чат: {LOG_CHAT_ID}")
     print(f"  • База данных: {DB_PATH}")
-    print(f"  • РП-темы: {sorted(RP_TOPICS) or 'нет'}")
-    print(f"  • Оффтоп-темы: {sorted(OFFTOP_TOPICS) or 'нет'}")
+    print(f"  • РП-темы (с таймером): {sorted(RP_TOPICS) or 'нет'}")
+    print(f"  • Оффтоп-темы (мгновенные): {sorted(OFFTOP_TOPICS) or 'нет'}")
     print(f"  • Таймер RP: {format_seconds(RP_TIMER_SECONDS)}")
 
-    # 1. Запуск встроенного веб-сервера для Health Check (Render/Railway/Koyeb)
     start_health_check_server()
-
-    # 2. Восстановление сохраненной очереди из базы данных
     restore_queue_on_startup()
 
-    # 3. Фоновый поток сторожа
     watchdog_thread = threading.Thread(target=watchdog_background_worker, daemon=True, name="WatchdogWorker")
     watchdog_thread.start()
 
-    # 4. Отправка уведомления о старте в лог-группу
     log_event(
         f"🚀 <b>Cleaner Bot успешно запущен!</b>\n\n"
         f"⏱ <b>Таймер RP:</b> <code>{format_seconds(RP_TIMER_SECONDS)}</code>\n"
-        f"📝 <b>Лимит Оффтопа:</b> <code>{OFFTOP_MIN_WORDS}-{OFFTOP_MAX_WORDS} слов</code>\n"
-        f"🗂 <b>РП-темы:</b> <code>{sorted(RP_TOPICS) or '—'}</code>\n"
-        f"🗑 <b>Оффтоп-темы:</b> <code>{sorted(OFFTOP_TOPICS) or '—'}</code>"
+        f"🗂 <b>РП-темы (удаление без # по таймеру):</b> <code>{sorted(RP_TOPICS) or '—'}</code>\n"
+        f"🗑 <b>Оффтоп-темы (мгновенно):</b> <code>{sorted(OFFTOP_TOPICS) or '—'}</code>"
     )
 
-    # 5. Бесконечный цикл Polling с защитой от сбоев сети
     RETRY_DELAYS = [3, 5, 10, 20, 30]
     attempt = 0
 
