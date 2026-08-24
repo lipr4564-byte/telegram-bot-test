@@ -147,6 +147,8 @@ def db_clear_all_pending():
 
 
 # ─── Кэш конфига в памяти (обновляется при изменениях) ────────────────────────
+init_db()  # таблицы должны существовать до первого чтения конфига ниже
+
 cache_lock = threading.Lock()
 RP_TIMER_SECONDS = int(get_config('rp_timer_seconds', 2400))
 OFFTOP_MIN_WORDS = int(get_config('offtop_min_words', 1))
@@ -478,7 +480,6 @@ def legacy_commands_redirect(message):
 
 # ─── Запуск ───────────────────────────────────────────────────────────────────
 if __name__ == '__main__':
-    init_db()
     reload_topics_cache()
 
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] Чистильщик запущен.")
